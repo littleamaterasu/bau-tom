@@ -3,9 +3,11 @@ const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const { register, login } = require("./services/authService");
-const { rollDice } = require("./services/diceService");
-const { createRoom, joinRoom, leaveRoom, getRoomList, getRoomPlayers } = require("./services/roomService");
+const { createRoom, joinRoom, leaveRoom, getRoomList, getRoomPlayers, gamble, gambleResult, diceHistory } = require("./services/roomService");
+const { rollDice } = require('./services/diceService');
 const socketIo = require("socket.io");
+
+const INTERVAL_TIME = 40000; // 40 giây
 
 // Kết nối MongoDB
 mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
@@ -61,13 +63,24 @@ io.on("connection", (socket) => {
         createRoom(roomId);
         socket.join(roomId);
         io.emit("room_list", getRoomList());
+
+        setInterval(() => {
+            result = rollDice(diceHistory[roomId] ? diceHistory[roomId].face : 1);
+            io.to(roomId).emit("dice_result", result);
+            gambleResult(roomId, result);
+            io.to(roomId).emit("room_players", getRoomPlayers(roomId));
+        }, INTERVAL_TIME)
     });
 
     // vào phòng
-    socket.on("join_room", (roomId) => {
-        joinRoom(roomId, socket.id);
-        socket.join(roomId);
-        io.to(roomId).emit("room_players", getRoomPlayers(roomId));
+    socket.on("join_room", async (roomId, username) => {
+        try {
+            await joinRoom(roomId, username); // Thêm username vào phòng
+            socket.join(roomId);
+            io.to(roomId).emit("room_players", getRoomPlayers(roomId)); // Gửi lại danh sách người chơi trong phòng
+        } catch (err) {
+            socket.emit("error", err.message);
+        }
     });
 
     // rời phòng
@@ -77,15 +90,10 @@ io.on("connection", (socket) => {
         io.emit("room_list", getRoomList());
     });
 
-    // lăn xúc sắc cho các phòng
-    socket.on("rolling_dice", ({ roomId, currentFace }) => {
-        if (!roomId || !io.sockets.adapter.rooms.get(roomId)) {
-            socket.emit("error", "Room does not exist");
-            return;
-        }
-
-        const result = rollDice(currentFace);
-        io.to(roomId).emit("dice_result", result);
+    // đặt cược
+    socket.on("gamble", async (roomId, username, amount, option) => {
+        await gamble(roomId, username, amount, option);
+        io.to(roomId).emit("room_players", getRoomPlayers(roomId));
     });
 
     socket.on("disconnect", () => {
