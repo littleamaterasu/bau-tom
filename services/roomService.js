@@ -38,14 +38,14 @@ async function gamble(roomId, username, amount, option) {
         return { success: false, message: "Không tìm thấy người chơi trong phòng" };
     }
 
-    const balance = player.money;
+    const balance = player.balance;
     rooms[roomId].playersOption[username] = { option: option, amount: amount };
 
     if (balance < amount) {
         return { success: false, message: "Không đủ tiền" };
     }
 
-    player.money -= amount;
+    player.balance -= amount;
 
     try {
         const playerInDb = await User.findOne({ username: player.username });
@@ -53,14 +53,13 @@ async function gamble(roomId, username, amount, option) {
             throw new Error("Không tìm thấy người chơi trong cơ sở dữ liệu");
         }
 
-        playerInDb.money = player.money;
+        playerInDb.balance = player.balance;
 
         await playerInDb.save();
 
         return {
             success: true,
-            message: `Đặt cược thành công, người chơi ${player.username} còn lại ${player.money}`,
-            player: playerInDb
+            message: `Đặt cược thành công, người chơi ${player.username} còn lại ${player.balance}`,
         };
     } catch (err) {
         console.error(err);
@@ -78,20 +77,20 @@ async function gambleResult(roomId, diceResult) {
     diceHistory[roomId].push(diceResult);
     room.players.forEach(async (player) => {
         if (room.playersOption[player.username].option === diceResult.face) {
-            player.money += 2 * room.playersOption[player.username].amount;
+            player.balance += 2 * room.playersOption[player.username].amount;
             try {
                 const playerInDb = await User.findOne({ username: player.username });
                 if (!playerInDb) {
                     throw new Error("Không tìm thấy người chơi trong cơ sở dữ liệu");
                 }
 
-                playerInDb.balance = player.money;
+                playerInDb.balance = player.balance;
 
                 await playerInDb.save();
 
                 return {
                     success: true,
-                    message: `Đã thắng cược! Người chơi ${player.username} còn lại ${player.money}`,
+                    message: `Đã thắng cược! Người chơi ${player.username} còn lại ${player.balance}`,
                     player: playerInDb
                 };
             } catch (err) {
@@ -141,23 +140,29 @@ async function joinRoom(roomId, playerId) {
 
     console.log('Người chơi mới vào phòng', roomId, 'là', player.username);
 
-    rooms[roomId].players.push(player); // Lưu cả thông tin username, money
+    rooms[roomId].players.push({
+        username: player.username,
+        balance: player.balance
+    }); // Lưu cả thông tin username, balance
     rooms[roomId].playersOption[player.username] = { option: 0, amount: 0 };
     console.log('Danh sách tùy chọn phòng', rooms[roomId].playersOption);
     return { success: true, message: "Người chơi đã tham gia phòng.", player };
 }
 
 // Hàm rời phòng
-function leaveRoom(roomId, playerId) {
+function leaveRoom(roomId, username) {
     if (!rooms[roomId]) {
         return { success: false, message: "Phòng không tồn tại." };
     }
 
-    const index = rooms[roomId].players.indexOf(playerId);
+    // Tìm người chơi theo username
+    const index = rooms[roomId].players.findIndex(player => player.username === username);
+
     if (index === -1) {
         return { success: false, message: "Người chơi không có trong phòng." };
     }
 
+    // Xóa người chơi khỏi phòng
     rooms[roomId].players.splice(index, 1);
 
     // Xóa phòng nếu không còn ai
@@ -168,14 +173,23 @@ function leaveRoom(roomId, playerId) {
     return { success: true, message: "Người chơi đã rời phòng." };
 }
 
+
 function getRoomList() {
-    return Object.keys(rooms);
+    return Object.keys(rooms).map(roomId => ({
+        roomId: roomId,
+        currentPlayers: rooms[roomId].players.length
+    }));
 }
+
 
 function getRoomPlayers(roomId) {
     roomId = roomId.toString();
-    console.log('Lấy danh sách người chơi từ phòng', roomId)
-    return rooms[roomId] ? rooms[roomId].players : [];
+    console.log('Lấy danh sách người chơi từ phòng', roomId);
+    return rooms[roomId] ?
+        {
+            playerDatas: rooms[roomId].players,
+            roomId: roomId
+        } : null;
 }
 
-module.exports = { createRoom, joinRoom, leaveRoom, getRoomList, getRoomPlayers, gamble, gambleResult, diceHistory };
+module.exports = { rooms, createRoom, joinRoom, leaveRoom, getRoomList, getRoomPlayers, gamble, gambleResult, diceHistory };

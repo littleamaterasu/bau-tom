@@ -3,11 +3,11 @@ const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const { register, login } = require("./services/authService");
-const { createRoom, joinRoom, leaveRoom, getRoomList, getRoomPlayers, gamble, gambleResult, diceHistory } = require("./services/roomService");
+const { createRoom, joinRoom, leaveRoom, getRoomList, getRoomPlayers, gamble, gambleResult, diceHistory, rooms } = require("./services/roomService");
 const { rollDice } = require('./services/diceService');
-const socketIo = require("socket.io");
+const { WebSocketServer } = require("ws");
 
-const INTERVAL_TIME = 40000; // 40 giây
+const INTERVAL_TIME = 15000;
 
 // Kết nối MongoDB
 mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
@@ -22,14 +22,135 @@ const server = app.listen(process.env.PORT, () => {
     console.log(`Server running on port ${process.env.PORT}`);
 });
 
-const io = socketIo(server, {
-    cors: {
-        origin: "*",
-    },
+const wss = new WebSocketServer({ server });
+const clients = new Map();
+const clientInfo = new Map(); // Lưu { ws: { username, roomId } }
+
+// interval của các room
+const roomInterval = {};
+
+wss.on("connection", (ws) => {
+    console.log("User connected");
+
+    ws.send(JSON.stringify({ eventName: "room_list", data: getRoomList() }));
+
+    ws.on("message", async (message) => {
+        try {
+            const { eventName, data } = JSON.parse(message);
+            console.log(eventName, data)
+            switch (eventName) {
+                case "create_room":
+                    createRoom(data.roomId);
+                    broadcast({ eventName: "room_list", data: getRoomList() });
+
+                    // để cho interval là của cả server
+                    roomInterval[data.roomId] = setInterval(async () => {
+                        const result = rollDice(diceHistory[data.roomId] ? diceHistory[data.roomId].face : 1);
+                        const gamblingResult = await gambleResult(data.roomId, result);
+                        broadcastToRoom(data.roomId, { eventName: "dice_result", data: result });
+                        broadcastToRoom(data.roomId, { eventName: "room_players", data: getRoomPlayers(data.roomId) });
+                    }, INTERVAL_TIME);
+                    break;
+
+                case "join_room":
+                    const joinRoomResult = await joinRoom(data.roomId, data.username);
+                    if (joinRoomResult.success) {
+
+                        clients.set(ws, data.roomId);
+                        ws.send(JSON.stringify({
+                            eventName: "join_room_success",
+                            data: {
+                                username: data.username,
+                                roomId: data.roomId
+                            }
+                        }))
+                        clientInfo.set(ws, { username: data.username, roomId: data.roomId });
+                        broadcast({ eventName: "room_list", data: getRoomList() });
+                        broadcastToRoom(data.roomId, { eventName: "room_players", data: getRoomPlayers(data.roomId) });
+                    }
+                    break;
+
+                case "leave_room":
+                    const leaveRoomResult = leaveRoom(data.roomId, data.username);
+
+                    // xử lý khi thực hiện rời thành công
+                    if (leaveRoomResult.success) {
+                        console.log('leave room success')
+                        // xóa interval nếu phòng bị xóa
+                        if (!rooms[data.roomId]) {
+                            clearInterval(roomInterval[data.roomId]);
+                        }
+
+                        // đặt lại trong map
+                        clientInfo.delete(ws);
+
+                        // thông báo rời thành công
+                        ws.send(
+                            JSON.stringify(
+                                {
+                                    eventName: "leave_room_success",
+                                    data: ""
+                                }))
+                        clients.delete(ws);
+                        if (getRoomList() !== null) {
+                            broadcast({ eventName: "room_list", data: getRoomList() });
+                        }
+                    }
+                    break;
+
+                case "gamble":
+                    const gambleRequestResult = await gamble(data.roomId, data.username, parseInt(data.amount), parseInt(data.option));
+                    if (gambleRequestResult.success) {
+                        ws.send(
+                            JSON.stringify({
+                                eventName: "gameble_success"
+                            }));
+
+                        broadcastToRoom(data.roomId, { eventName: "room_players", data: getRoomPlayers(data.roomId) });
+                    } else {
+                        console.log(gambleRequestResult.message)
+                    }
+                    break;
+            }
+        } catch (err) {
+            ws.send(JSON.stringify({ eventName: "error", data: err.message }));
+        }
+    });
+
+    ws.on("close", () => {
+        const userData = clientInfo.get(ws);
+        if (userData && userData.username !== '' && userData.roomId !== '') {
+            const result = leaveRoom(userData.roomId, userData.username);
+            clientInfo.delete(ws);
+            if (getRoomPlayers(userData.roomId) === null) {
+                clearInterval(roomInterval[userData.roomId]);
+            }
+        }
+        clients.delete(ws);
+        broadcast({ eventName: "room_list", data: getRoomList() });
+        console.log("User disconnected");
+    });
 });
 
+function broadcast(message) {
+    console.log('broadcast', message)
+    wss.clients.forEach(client => {
+        if (client.readyState === client.OPEN) {
+            client.send(JSON.stringify(message));
+        }
+    });
+}
+
+function broadcastToRoom(roomId, message) {
+    console.log('broadcast', roomId, message)
+    wss.clients.forEach(client => {
+        if (clients.get(client) === roomId && client.readyState === client.OPEN) {
+            client.send(JSON.stringify(message));
+        }
+    });
+}
+
 // ======= Express API =======
-// Đăng ký
 app.post("/register", async (req, res) => {
     try {
         const { username, password } = req.body;
@@ -40,7 +161,6 @@ app.post("/register", async (req, res) => {
     }
 });
 
-// Đăng nhập
 app.post("/login", async (req, res) => {
     try {
         const { username, password } = req.body;
@@ -49,54 +169,4 @@ app.post("/login", async (req, res) => {
     } catch (err) {
         res.status(400).json(err);
     }
-});
-
-// ======= Socket.IO =======
-io.on("connection", (socket) => {
-    console.log(`User connected: ${socket.id}`);
-
-    // trả về danh sách các phòng đang có
-    io.emit("room_list", getRoomList());
-
-    // tạo phòng mới
-    socket.on("create_room", (roomId) => {
-        createRoom(roomId);
-        socket.join(roomId);
-        io.emit("room_list", getRoomList());
-
-        setInterval(() => {
-            result = rollDice(diceHistory[roomId] ? diceHistory[roomId].face : 1);
-            io.to(roomId).emit("dice_result", result);
-            gambleResult(roomId, result);
-            io.to(roomId).emit("room_players", getRoomPlayers(roomId));
-        }, INTERVAL_TIME)
-    });
-
-    // vào phòng
-    socket.on("join_room", async (roomId, username) => {
-        try {
-            await joinRoom(roomId, username); // Thêm username vào phòng
-            socket.join(roomId);
-            io.to(roomId).emit("room_players", getRoomPlayers(roomId)); // Gửi lại danh sách người chơi trong phòng
-        } catch (err) {
-            socket.emit("error", err.message);
-        }
-    });
-
-    // rời phòng
-    socket.on("leave_room", (roomId) => {
-        leaveRoom(roomId, socket.id);
-        socket.leave(roomId);
-        io.emit("room_list", getRoomList());
-    });
-
-    // đặt cược
-    socket.on("gamble", async (roomId, username, amount, option) => {
-        await gamble(roomId, username, amount, option);
-        io.to(roomId).emit("room_players", getRoomPlayers(roomId));
-    });
-
-    socket.on("disconnect", () => {
-        console.log(`User disconnected: ${socket.id}`);
-    });
 });
